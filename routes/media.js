@@ -4,6 +4,7 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const jwt = require('jsonwebtoken');
+const mongoose = require('mongoose');
 
 const auth = require('../middleware/auth');
 const MediaAsset = require('../models/MediaAsset');
@@ -71,5 +72,99 @@ router.get('/stream/:id', async (req, res) => {
   // Note: This route is mounted at app level in server.js; kept here to group logic.
   res.status(404).json({ error: 'Not implemented here' });
 });
+
+// POST /media/:id/view -> log a view (JWT-protected)
+router.post('/:id/view', auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ error: 'Invalid media id' });
+    }
+
+    const media = await MediaAsset.findById(id);
+    if (!media) {
+      return res.status(404).json({ error: 'Media not found' });
+    }
+
+    // Prefer server-derived IP to prevent spoofing
+    const ip =
+      (req.headers['x-forwarded-for']?.split(',')[0]?.trim()) ||
+      req.socket?.remoteAddress ||
+      req.ip ||
+      'unknown';
+
+    // Optional: allow client to pass timestamp, else use server time
+    const ts = req.body?.timestamp ? new Date(req.body.timestamp) : new Date();
+    if (Number.isNaN(ts.getTime())) {
+      return res.status(400).json({ error: 'Invalid timestamp format' });
+    }
+
+    await MediaViewLog.create({
+      media_id: media._id,
+      viewed_by_ip: ip,
+      timestamp: ts,
+    });
+
+    return res.status(201).json({ message: 'View logged successfully' });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /media/:id/analytics -> aggregated analytics (JWT-protected)
+router.get('/:id/analytics', auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ error: 'Invalid media id' });
+    }
+
+    const media = await MediaAsset.findById(id).select('_id');
+    if (!media) {
+      return res.status(404).json({ error: 'Media not found' });
+    }
+
+    const mediaObjectId = new mongoose.Types.ObjectId(id);
+
+    // 1) views_per_day (UTC)
+    const perDay = await MediaViewLog.aggregate([
+      { $match: { media_id: mediaObjectId } },
+      {
+        $group: {
+          _id: {
+            $dateToString: { format: '%Y-%m-%d', date: '$timestamp', timezone: 'UTC' },
+          },
+          count: { $sum: 1 },
+        },
+      },
+      { $sort: { _id: 1 } },
+    ]);
+
+    const views_per_day = perDay.reduce((acc, d) => {
+      acc[d._id] = d.count;
+      return acc;
+    }, {});
+
+    // 2) total_views
+    const total_views = await MediaViewLog.countDocuments({ media_id: mediaObjectId });
+
+    // 3) unique_ips
+    const uniqueIPs = await MediaViewLog.distinct('viewed_by_ip', { media_id: mediaObjectId });
+    const unique_ips = uniqueIPs.length;
+
+    return res.json({
+      total_views,
+      unique_ips,
+      views_per_day,
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
 
 module.exports = router;
