@@ -6,6 +6,9 @@ const fs = require('fs');
 const jwt = require('jsonwebtoken');
 const mongoose = require('mongoose');
 
+const getRedis = require('../config/redis');
+const { viewLimiter } = require('../middleware/rateLimiter');
+
 const auth = require('../middleware/auth');
 const MediaAsset = require('../models/MediaAsset');
 const MediaViewLog = require('../models/MediaViewLog');
@@ -73,8 +76,8 @@ router.get('/stream/:id', async (req, res) => {
   res.status(404).json({ error: 'Not implemented here' });
 });
 
-// POST /media/:id/view -> log a view (JWT-protected)
-router.post('/:id/view', auth, async (req, res) => {
+// POST /media/:id/view -> log a view (JWT-protected, rate-limited)
+router.post('/:id/view', auth, viewLimiter, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -87,14 +90,12 @@ router.post('/:id/view', auth, async (req, res) => {
       return res.status(404).json({ error: 'Media not found' });
     }
 
-    // Prefer server-derived IP to prevent spoofing
     const ip =
       (req.headers['x-forwarded-for']?.split(',')[0]?.trim()) ||
       req.socket?.remoteAddress ||
       req.ip ||
       'unknown';
 
-    // Optional: allow client to pass timestamp, else use server time
     const ts = req.body?.timestamp ? new Date(req.body.timestamp) : new Date();
     if (Number.isNaN(ts.getTime())) {
       return res.status(400).json({ error: 'Invalid timestamp format' });
@@ -106,6 +107,15 @@ router.post('/:id/view', auth, async (req, res) => {
       timestamp: ts,
     });
 
+    // Invalidate analytics cache for this media
+    try {
+      const redis = getRedis();
+      await redis.del(`media:analytics:${id}`);
+    } catch (e) {
+      // cache miss or redis down should not break writes
+      console.warn('Redis DEL failed (non-fatal):', e.message);
+    }
+
     return res.status(201).json({ message: 'View logged successfully' });
   } catch (err) {
     console.error(err);
@@ -113,11 +123,11 @@ router.post('/:id/view', auth, async (req, res) => {
   }
 });
 
-// GET /media/:id/analytics -> aggregated analytics (JWT-protected)
+
+// GET /media/:id/analytics -> aggregated analytics (JWT-protected, cached)
 router.get('/:id/analytics', auth, async (req, res) => {
   try {
     const { id } = req.params;
-
     if (!mongoose.isValidObjectId(id)) {
       return res.status(400).json({ error: 'Invalid media id' });
     }
@@ -127,16 +137,30 @@ router.get('/:id/analytics', auth, async (req, res) => {
       return res.status(404).json({ error: 'Media not found' });
     }
 
+    const cacheKey = `media:analytics:${id}`;
+    const ttl = parseInt(process.env.ANALYTICS_CACHE_TTL_SEC || '60', 10);
+
+    // Try cache
+    try {
+      const redis = getRedis();
+      await redis.connect().catch(() => {}); // safe connect if not yet connected
+      const cached = await redis.get(cacheKey);
+      if (cached) {
+        res.set('X-Cache', 'HIT');
+        return res.json(JSON.parse(cached));
+      }
+    } catch (e) {
+      console.warn('Redis GET failed (non-fatal):', e.message);
+    }
+
     const mediaObjectId = new mongoose.Types.ObjectId(id);
 
-    // 1) views_per_day (UTC)
+    // views_per_day (UTC)
     const perDay = await MediaViewLog.aggregate([
       { $match: { media_id: mediaObjectId } },
       {
         $group: {
-          _id: {
-            $dateToString: { format: '%Y-%m-%d', date: '$timestamp', timezone: 'UTC' },
-          },
+          _id: { $dateToString: { format: '%Y-%m-%d', date: '$timestamp', timezone: 'UTC' } },
           count: { $sum: 1 },
         },
       },
@@ -148,23 +172,28 @@ router.get('/:id/analytics', auth, async (req, res) => {
       return acc;
     }, {});
 
-    // 2) total_views
     const total_views = await MediaViewLog.countDocuments({ media_id: mediaObjectId });
+    const unique_ips = (await MediaViewLog.distinct('viewed_by_ip', { media_id: mediaObjectId })).length;
 
-    // 3) unique_ips
-    const uniqueIPs = await MediaViewLog.distinct('viewed_by_ip', { media_id: mediaObjectId });
-    const unique_ips = uniqueIPs.length;
+    const payload = { total_views, unique_ips, views_per_day };
 
-    return res.json({
-      total_views,
-      unique_ips,
-      views_per_day,
-    });
+    // Set cache
+    try {
+      const redis = getRedis();
+      await redis.set(cacheKey, JSON.stringify(payload), 'EX', ttl);
+      res.set('X-Cache', 'MISS');
+    } catch (e) {
+      console.warn('Redis SET failed (non-fatal):', e.message);
+      res.set('X-Cache', 'SKIP');
+    }
+
+    return res.json(payload);
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: 'Server error' });
   }
 });
+
 
 
 module.exports = router;
